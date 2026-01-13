@@ -127,8 +127,10 @@ def generate_depth_and_pointcloud(model, frame_paths, output_dir, device):
         device: 设备
     
     Returns:
-        depth_maps: 深度图列表
-        point_clouds: 点云列表（每帧的点云）
+        depth_maps_raw: 原始深度图列表（未滤波）
+        depth_maps_filtered: 滤波后的深度图列表（自适应滤波，避免残影）
+        depth_maps_raw_vis: 原始深度图可视化列表
+        depth_maps_filtered_vis: 滤波后深度图可视化列表
         intrinsics_list: 内参列表
         extrinsics_list: 外参列表
     """
@@ -138,7 +140,6 @@ def generate_depth_and_pointcloud(model, frame_paths, output_dir, device):
     model = model.to(device)
     
     depth_maps = []
-    point_clouds = []
     intrinsics_list = []
     extrinsics_list = []
     
@@ -160,25 +161,33 @@ def generate_depth_and_pointcloud(model, frame_paths, output_dir, device):
         extrinsics = prediction.extrinsics[0]  # [3, 4] (w2c格式)
         intrinsics_list.append(intrinsics)
         extrinsics_list.append(extrinsics)
-        
-        # 生成点云
-        H, W = depth.shape
-        points_3d = depth_to_pointcloud(depth, intrinsics, extrinsics)
-        point_clouds.append(points_3d)
-        
-        # 保存深度图
-        depth_vis = (depth / depth.max() * 255).astype(np.uint8)
-        depth_path = os.path.join(output_dir, f"depth_{i:04d}.png")
-        cv2.imwrite(depth_path, depth_vis)
     
-    # 保存合并的点云
-    all_points = np.concatenate([pc.reshape(-1, 3) for pc in point_clouds], axis=0)
-    all_colors = None  # 可以添加颜色信息
+    # 统一使用第一帧的内参（相机内参在物理上应该是固定的）
+    if len(intrinsics_list) > 0:
+        unified_intrinsics = intrinsics_list[0]
+        print(f"统一使用第一帧的相机内参（假设相机固定，内参不变）")
+        print(f"  内参: fx={unified_intrinsics[0,0]:.1f}, fy={unified_intrinsics[1,1]:.1f}, cx={unified_intrinsics[0,2]:.1f}, cy={unified_intrinsics[1,2]:.1f}")
+        intrinsics_list = [unified_intrinsics] * len(depth_maps)
     
-    # 保存为PLY文件
-    save_pointcloud_ply(all_points, all_colors, os.path.join(output_dir, "pointcloud.ply"))
+    # 保存原始深度图
+    depth_maps_raw = [d.copy() for d in depth_maps]
     
-    return depth_maps, point_clouds, intrinsics_list, extrinsics_list
+    # 生成原始深度图可视化（简单归一化）
+    print("正在生成原始深度图可视化...")
+    depth_maps_raw_vis = []
+    for i, depth_map in enumerate(depth_maps_raw):
+        depth_valid = depth_map.copy()
+        depth_valid[depth_valid <= 0] = 0
+        if depth_valid.max() > 0:
+            depth_vis = (depth_valid / depth_valid.max() * 255).astype(np.uint8)
+        else:
+            depth_vis = np.zeros_like(depth_map, dtype=np.uint8)
+        depth_maps_raw_vis.append(depth_vis)
+    
+    # 对深度图进行自适应滤波（避免移动物体残影）
+    depth_maps_filtered, depth_maps_filtered_vis = filter_depth_maps_adaptive(depth_maps, motion_threshold=0.02)
+    
+    return depth_maps_raw, depth_maps_filtered, depth_maps_raw_vis, depth_maps_filtered_vis, intrinsics_list, extrinsics_list
 
 
 def depth_to_pointcloud(depth, intrinsics, extrinsics):
@@ -261,6 +270,172 @@ def load_annotated_frame_index(index_path):
     
     object_ids = np.load(index_path)
     return object_ids
+
+
+def filter_depth_maps_adaptive(depth_maps, motion_threshold=0.05):
+    """
+    自适应滤波深度图，避免移动物体产生残影，同时减少静态区域的闪烁
+    
+    原理：
+    - 检测运动区域（通过帧差，使用更严格的阈值避免误判）
+    - 对静态区域应用强时间滤波（5帧窗口，加权平均，减少闪烁）
+    - 对运动区域只应用空间滤波（避免残影）
+    
+    Args:
+        depth_maps: 原始深度图列表
+        motion_threshold: 运动检测阈值（深度值变化百分比，默认5%，避免误判静态区域为运动）
+    
+    Returns:
+        depth_maps_filtered: 滤波后的深度图列表
+        depth_maps_filtered_vis: 滤波后的深度图可视化列表
+    """
+    from scipy import ndimage
+    
+    print("正在对深度图进行自适应滤波（避免移动物体残影，减少静态区域闪烁）...")
+    if len(depth_maps) <= 1:
+        # 如果只有一帧，不需要滤波
+        depth_vis = []
+        for depth_map in depth_maps:
+            if depth_map.max() > 0:
+                depth_vis.append((depth_map / depth_map.max() * 255).astype(np.uint8))
+            else:
+                depth_vis.append(np.zeros_like(depth_map, dtype=np.uint8))
+        return depth_maps, depth_vis
+    
+    depth_maps_filtered = []
+    
+    # 第一步：检测所有帧的运动区域（使用更严格的逻辑）
+    print("  步骤1: 检测运动区域（阈值={:.1%}）...".format(motion_threshold))
+    all_motion_masks = []
+    
+    for i in range(len(depth_maps)):
+        depth_map = depth_maps[i]
+        valid_mask = (depth_map > 0) & np.isfinite(depth_map)
+        motion_mask = np.zeros_like(depth_map, dtype=bool)
+        
+        # 检查前帧和后帧，需要连续两帧都检测到变化才认为是运动
+        if i > 0:
+            prev_depth = depth_maps[i-1]
+            prev_valid = (prev_depth > 0) & np.isfinite(prev_depth)
+            both_valid = valid_mask & prev_valid
+            
+            if both_valid.sum() > 0:
+                depth_diff = np.abs(depth_map - prev_depth)
+                depth_mean = (depth_map + prev_depth) / 2.0
+                depth_change_ratio = np.zeros_like(depth_map)
+                depth_change_ratio[both_valid] = depth_diff[both_valid] / (depth_mean[both_valid] + 1e-6)
+                # 需要变化超过阈值，才认为是运动
+                motion_mask[both_valid] = depth_change_ratio[both_valid] > motion_threshold
+        
+        if i < len(depth_maps) - 1:
+            next_depth = depth_maps[i+1]
+            next_valid = (next_depth > 0) & np.isfinite(next_depth)
+            both_valid = valid_mask & next_valid
+            
+            if both_valid.sum() > 0:
+                depth_diff = np.abs(depth_map - next_depth)
+                depth_mean = (depth_map + next_depth) / 2.0
+                depth_change_ratio = np.zeros_like(depth_map)
+                depth_change_ratio[both_valid] = depth_diff[both_valid] / (depth_mean[both_valid] + 1e-6)
+                motion_mask[both_valid] = motion_mask[both_valid] | (depth_change_ratio[both_valid] > motion_threshold)
+        
+        # 对运动区域使用形态学扩展，但不要过度扩展
+        if motion_mask.sum() > 0:
+            motion_mask = ndimage.binary_dilation(motion_mask, structure=np.ones((3, 3)), iterations=1)
+        
+        all_motion_masks.append(motion_mask)
+    
+    # 第二步：对静态区域应用强时间滤波，对运动区域只应用空间滤波
+    print("  步骤2: 应用自适应滤波（静态区域：5帧加权平均，运动区域：仅空间滤波）...")
+    
+    for i in range(len(depth_maps)):
+        depth_map = depth_maps[i].copy()
+        valid_mask = (depth_map > 0) & np.isfinite(depth_map)
+        motion_mask = all_motion_masks[i]
+        
+        if valid_mask.sum() == 0:
+            depth_maps_filtered.append(depth_map)
+            continue
+        
+        # 对静态区域应用强时间滤波（5帧窗口，加权平均）
+        static_mask = valid_mask & (~motion_mask)
+        
+        if static_mask.sum() > 0:
+            window_size = 5  # 使用5帧窗口，增强平滑效果
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(depth_maps), i + window_size // 2 + 1)
+            window = depth_maps[start_idx:end_idx]
+            
+            stacked = np.stack(window)
+            n_frames = stacked.shape[0]
+            
+            if n_frames > 1:
+                # 使用高斯权重，中间帧权重更高
+                center = (n_frames - 1) / 2.0
+                sigma = n_frames / 4.0  # 集中权重分布
+                positions = np.arange(n_frames)
+                weights = np.exp(-0.5 * ((positions - center) / sigma) ** 2)
+                weights = weights / weights.sum()  # 归一化
+                
+                # 对静态区域，计算加权平均（更好的平滑效果）
+                weighted_sum = np.zeros_like(stacked[0])
+                weight_sum = np.zeros_like(stacked[0])
+                
+                for j in range(n_frames):
+                    frame_valid = np.isfinite(stacked[j]) & (stacked[j] > 0)
+                    static_and_frame_valid = static_mask & frame_valid
+                    weighted_sum[static_and_frame_valid] += stacked[j][static_and_frame_valid] * weights[j]
+                    weight_sum[static_and_frame_valid] += weights[j]
+                
+                # 避免除零
+                valid_static = weight_sum > 0
+                depth_map[valid_static] = weighted_sum[valid_static] / (weight_sum[valid_static] + 1e-6)
+        
+        # 对所有区域应用空间滤波（去除噪声）
+        # 使用较小的窗口（3x3），只去除噪声，不影响残影
+        depth_for_filter = depth_map.copy()
+        depth_for_filter[~valid_mask] = 0
+        filtered = ndimage.median_filter(depth_for_filter, size=3)
+        filtered[~valid_mask] = depth_map[~valid_mask]  # 保持无效区域不变
+        depth_map = filtered
+        
+        depth_maps_filtered.append(depth_map)
+    
+    # 生成可视化
+    print("正在生成滤波后的深度图可视化（全局归一化）...")
+    depth_maps_filtered_vis = []
+    
+    # 收集所有帧的有效深度值
+    all_depths = []
+    for depth_map in depth_maps_filtered:
+        depth_valid = depth_map[(depth_map > 0) & np.isfinite(depth_map)]
+        if len(depth_valid) > 0:
+            all_depths.append(depth_valid)
+    
+    if len(all_depths) > 0:
+        all_depths = np.concatenate(all_depths)
+        depth_min = np.percentile(all_depths, 5)
+        depth_max = np.percentile(all_depths, 95)
+        print(f"  全局深度范围: [{depth_min:.3f}, {depth_max:.3f}] (5%-95%百分位)")
+    else:
+        depth_min = 0
+        depth_max = 1
+    
+    # 对所有帧使用相同的归一化参数
+    for depth_map in depth_maps_filtered:
+        depth_valid = depth_map.copy()
+        depth_valid[depth_valid <= 0] = 0
+        depth_valid = np.clip(depth_valid, depth_min, depth_max)
+        
+        if depth_max > depth_min:
+            depth_vis = ((depth_valid - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+        else:
+            depth_vis = np.zeros_like(depth_map, dtype=np.uint8)
+        
+        depth_maps_filtered_vis.append(depth_vis)
+    
+    print("  ✓ 自适应滤波完成（静态区域时间滤波，运动区域仅空间滤波）")
+    return depth_maps_filtered, depth_maps_filtered_vis
 
 
 def load_object_labels(labels_path):
@@ -808,50 +983,68 @@ def create_video_from_images(image_dir, output_video_path, fps=10.0, pattern="*.
     print(f"✓ 视频已保存到: {output_video_path}")
 
 
-def process_single_episode(input_dir, output_dir, model, device, max_frames=None, tracked_pixels=None, video_fps=10.0):
+def process_with_depth_maps(
+    depth_maps,
+    depth_vis_maps,
+    frame_paths,
+    input_path,
+    intrinsics_list,
+    extrinsics_list,
+    output_path,
+    tracked_pixels,
+    label_map,
+    video_fps,
+    mode_name="",
+):
     """
-    处理单个episode的数据
+    使用指定的深度图进行后续处理（SDF计算、可视化等）
     
     Args:
-        input_dir: 输入目录（包含rgb.mp4和frame_*/目录）
-        output_dir: 输出目录
-        model: DepthAnything3模型
-        device: 设备
-        max_frames: 最大处理帧数
-        tracked_pixels: list of (x, y) tuples，要记录的像素坐标（格式：[(x1, y1), (x2, y2), ...]）
+        depth_maps: 用于点云生成的深度图列表
+        depth_vis_maps: 用于可视化的深度图列表
+        frame_paths: RGB帧路径列表
+        input_path: 输入目录路径
+        intrinsics_list: 内参列表
+        extrinsics_list: 外参列表
+        output_path: 输出目录
+        tracked_pixels: 要记录的像素坐标列表
+        label_map: 标签映射
+        video_fps: 视频帧率
+        mode_name: 模式名称（用于输出目录命名，如"raw"或"filtered"）
     """
-    input_path = Path(input_dir)
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    if mode_name:
+        mode_output_path = output_path / mode_name
+    else:
+        mode_output_path = output_path
+    mode_output_path.mkdir(parents=True, exist_ok=True)
     
-    # 1. 从视频提取帧
-    video_path = input_path / "rgb.mp4"
-    # if not video_path.exists():
-    #     raise FileNotFoundError(f"找不到视频文件: {video_path}")
+    # 保存深度图可视化
+    depth_dir = mode_output_path / "depths"
+    depth_dir.mkdir(exist_ok=True)
+    for i, depth_vis in enumerate(depth_vis_maps):
+        depth_path = depth_dir / f"depth_{i:04d}.png"
+        cv2.imwrite(str(depth_path), depth_vis)
     
-    frames_dir = output_path / "frames"
-    frame_paths = extract_frames_from_video(str(video_path), str(frames_dir), max_frames)
+    # 创建输出目录
+    frames_dir = mode_output_path / "frames"
+    frames_dir.mkdir(exist_ok=True)
     
-    # 2. 生成深度图和点云
-    depth_dir = output_path / "depths"
-    depth_maps, point_clouds, intrinsics_list, extrinsics_list = generate_depth_and_pointcloud(
-        model, frame_paths, str(depth_dir), device
-    )
+    # 复制RGB帧（如果存在）
+    if len(frame_paths) > 0:
+        for i, frame_path in enumerate(frame_paths):
+            if Path(frame_path).exists():
+                dst_path = frames_dir / f"frame_{i:04d}.png"
+                import shutil
+                shutil.copy(frame_path, dst_path)
     
-    # 3. 加载标签映射（如果有）
-    labels_path = input_path / "labels.txt"
-    label_map = load_object_labels(str(labels_path))
-    if label_map:
-        print(f"已加载 {len(label_map)} 个物体标签")
-    
-    # 4. 计算SDF
-    sdf_dir = output_path / "sdf"
-    sdf_npy_dir = output_path / "sdf_npy"
-    sdf_vis_dir = output_path / "sdf_vis"
-    sdf_exp_npy_dir = output_path / "sdf_exp_npy"  # 指数变换SDF的npy文件
-    sdf_exp_vis_dir = output_path / "sdf_exp_vis"  # 指数变换SDF的可视化
-    pixel_details_dir = output_path / "pixel_details"
-    rgb_marked_dir = output_path / "rgb_marked"  # 标记后的RGB图像
+    # 创建SDF相关目录
+    sdf_dir = mode_output_path / "sdf"
+    sdf_npy_dir = mode_output_path / "sdf_npy"
+    sdf_vis_dir = mode_output_path / "sdf_vis"
+    sdf_exp_npy_dir = mode_output_path / "sdf_exp_npy"
+    sdf_exp_vis_dir = mode_output_path / "sdf_exp_vis"
+    pixel_details_dir = mode_output_path / "pixel_details"
+    rgb_marked_dir = mode_output_path / "rgb_marked"
     
     os.makedirs(sdf_dir, exist_ok=True)
     os.makedirs(sdf_npy_dir, exist_ok=True)
@@ -862,10 +1055,10 @@ def process_single_episode(input_dir, output_dir, model, device, max_frames=None
         os.makedirs(pixel_details_dir, exist_ok=True)
         os.makedirs(rgb_marked_dir, exist_ok=True)
     
-    print("正在计算SDF值...")
-    all_pixel_details = {}  # 存储所有帧的像素详细信息
+    print(f"正在计算SDF值 ({mode_name}模式)...")
+    all_pixel_details = {}
     
-    for i in tqdm(range(len(frame_paths)), desc="计算SDF"):
+    for i in tqdm(range(len(frame_paths)), desc=f"计算SDF ({mode_name})"):
         # 加载annotated_frame_index
         frame_dir = input_path / f"frame_{i:04d}"
         index_path = frame_dir / "annotated_frame_index.npy"
@@ -886,38 +1079,43 @@ def process_single_episode(input_dir, output_dir, model, device, max_frames=None
         else:
             object_ids = load_annotated_frame_index(str(index_path))
         
-        # 获取3D点云
-        points_3d = point_clouds[i]
+        # 获取3D点云（使用对应的深度图重新生成）
+        depth_map = depth_maps[i]
+        current_intrinsics = intrinsics_list[i]
+        current_extrinsics = extrinsics_list[i]
+        
+        # 重新生成点云（使用对应的深度图）
+        points_3d = depth_to_pointcloud(depth_map, current_intrinsics, current_extrinsics)
+        invalid_mask = ~((depth_map > 0) & np.isfinite(depth_map))
+        points_3d[invalid_mask] = np.nan
         
         # 调整object_ids的尺寸以匹配points_3d
         if object_ids.shape != points_3d.shape[:2]:
-            # 需要调整尺寸
-            object_ids = cv2.resize(object_ids.astype(np.float32), 
-                                   (points_3d.shape[1], points_3d.shape[0]),
-                                   interpolation=cv2.INTER_NEAREST).astype(object_ids.dtype)
+            object_ids = cv2.resize(
+                object_ids.astype(np.float32),
+                (points_3d.shape[1], points_3d.shape[0]),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(object_ids.dtype)
         
-        # 加载RGB图像（如果存在且需要记录像素信息）
+        # 加载RGB图像（如果存在）
         rgb_image = None
-        if tracked_pixels:
-            frame_image_path = frames_dir / f"frame_{i:04d}.png"
+        if i < len(frame_paths):
+            frame_image_path = Path(frame_paths[i])
             if frame_image_path.exists():
                 rgb_image = cv2.imread(str(frame_image_path))
                 if rgb_image is not None:
-                    # 调整尺寸以匹配points_3d
                     if rgb_image.shape[:2] != points_3d.shape[:2]:
-                        rgb_image = cv2.resize(rgb_image, 
-                                              (points_3d.shape[1], points_3d.shape[0]))
-        
-        # 获取深度图
-        depth_map = depth_maps[i] if i < len(depth_maps) else None
-        
-        # 获取当前帧的相机参数
-        current_intrinsics = intrinsics_list[i] if i < len(intrinsics_list) else None
-        current_extrinsics = extrinsics_list[i] if i < len(extrinsics_list) else None
+                        rgb_image = cv2.resize(
+                            rgb_image,
+                            (points_3d.shape[1], points_3d.shape[0])
+                        )
         
         # 计算SDF（带详细记录）
         sdf_map, pixel_details = compute_sdf_for_frame(
-            points_3d, object_ids, i, str(sdf_dir),
+            points_3d,
+            object_ids,
+            i,
+            str(sdf_dir),
             rgb_image=rgb_image,
             depth_map=depth_map,
             tracked_pixels=tracked_pixels,
@@ -933,7 +1131,6 @@ def process_single_episode(input_dir, output_dir, model, device, max_frames=None
             with open(pixel_details_path, 'w', encoding='utf-8') as f:
                 json.dump(pixel_details, f, indent=2, ensure_ascii=False)
             
-            # 生成标记后的RGB图像
             if rgb_image is not None:
                 marked_rgb = mark_pixels_on_rgb(rgb_image, tracked_pixels, pixel_details, marker_size=5)
                 if marked_rgb is not None:
@@ -969,106 +1166,121 @@ def process_single_episode(input_dir, output_dir, model, device, max_frames=None
         }
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
-        print(f"\n像素详细信息已保存到: {summary_path}")
     
-    # 5. 生成视频
-    print("\n正在生成视频...")
-    if len(frame_paths) > 0:
-        # 生成深度图视频
-        depth_video_path = output_path / "depth_video.mp4"
-        create_video_from_images(
-            str(depth_dir),
-            str(depth_video_path),
-            fps=video_fps,
-            pattern="depth_*.png"
-        )
-        
-        # 生成原始SDF视频
-        sdf_video_path = output_path / "sdf_video.mp4"
-        create_video_from_images(
-            str(sdf_vis_dir),
-            str(sdf_video_path),
-            fps=video_fps,
-            pattern="sdf_*.png"
-        )
-        
-        # 生成指数变换SDF视频
-        sdf_exp_video_path = output_path / "sdf_exp_video.mp4"
-        create_video_from_images(
-            str(sdf_exp_vis_dir),
-            str(sdf_exp_video_path),
-            fps=video_fps,
-            pattern="sdf_exp_*.png"
-        )
-        
-        # 生成标记RGB视频（如果有追踪像素）
-        if tracked_pixels:
-            rgb_marked_video_path = output_path / "rgb_marked_video.mp4"
-            create_video_from_images(
-                str(rgb_marked_dir),
-                str(rgb_marked_video_path),
-                fps=video_fps,
-                pattern="rgb_marked_*.png"
-            )
+    # 生成GIF和视频
+    print(f"正在生成GIF和视频 ({mode_name}模式)...")
     
-    # 6. 生成GIF
-    print("\n正在生成GIF...")
-    if len(frame_paths) > 0:
-        # 计算每帧持续时间（毫秒），基于视频帧率
-        gif_duration = int(1000 / video_fps)  # 转换为毫秒
-        
-        # 生成RGB GIF
-        rgb_gif_path = output_path / "rgb.gif"
-        create_gif_from_images(
-            str(frames_dir),
-            str(rgb_gif_path),
-            pattern="frame_*.png",
-            duration=gif_duration,
-            loop=0
-        )
-        
-        # 生成标记RGB GIF（如果有追踪像素）
-        if tracked_pixels:
-            rgb_marked_gif_path = output_path / "rgb_marked.gif"
-            create_gif_from_images(
-                str(rgb_marked_dir),
-                str(rgb_marked_gif_path),
-                pattern="rgb_marked_*.png",
-                duration=gif_duration,
-                loop=0
-            )
-        
-        # 生成深度图GIF
-        depth_gif_path = output_path / "depth.gif"
-        create_gif_from_images(
-            str(depth_dir),
-            str(depth_gif_path),
-            pattern="depth_*.png",
-            duration=gif_duration,
-            loop=0
-        )
-        
-        # 生成SDF可视化GIF
-        sdf_vis_gif_path = output_path / "sdf_vis.gif"
-        create_gif_from_images(
-            str(sdf_vis_dir),
-            str(sdf_vis_gif_path),
-            pattern="sdf_*.png",
-            duration=gif_duration,
-            loop=0
-        )
-        
-        # 生成指数变换SDF可视化GIF
-        sdf_exp_vis_gif_path = output_path / "sdf_exp_vis.gif"
-        create_gif_from_images(
-            str(sdf_exp_vis_dir),
-            str(sdf_exp_vis_gif_path),
-            pattern="sdf_exp_*.png",
-            duration=gif_duration,
-            loop=0
-        )
+    # 深度图GIF和视频
+    create_gif_from_images(str(depth_dir), str(mode_output_path / "depth.gif"), pattern="depth_*.png", duration=100)
+    create_video_from_images(str(depth_dir), str(mode_output_path / "depth_video.mp4"), fps=video_fps, pattern="depth_*.png")
+    
+    # SDF可视化GIF和视频
+    create_gif_from_images(str(sdf_vis_dir), str(mode_output_path / "sdf_vis.gif"), pattern="sdf_*.png", duration=100)
+    create_video_from_images(str(sdf_vis_dir), str(mode_output_path / "sdf_video.mp4"), fps=video_fps, pattern="sdf_*.png")
+    
+    # 指数变换SDF可视化GIF和视频
+    create_gif_from_images(str(sdf_exp_vis_dir), str(mode_output_path / "sdf_exp_vis.gif"), pattern="sdf_exp_*.png", duration=100)
+    create_video_from_images(str(sdf_exp_vis_dir), str(mode_output_path / "sdf_exp_video.mp4"), fps=video_fps, pattern="sdf_exp_*.png")
+    
+    # RGB标记GIF和视频（如果有）
+    if tracked_pixels and (rgb_marked_dir.exists()):
+        create_gif_from_images(str(rgb_marked_dir), str(mode_output_path / "rgb_marked.gif"), pattern="rgb_marked_*.png", duration=100)
+        create_video_from_images(str(rgb_marked_dir), str(mode_output_path / "rgb_marked_video.mp4"), fps=video_fps, pattern="rgb_marked_*.png")
+    
+    # RGB GIF和视频（如果有）
+    if frames_dir.exists():
+        create_gif_from_images(str(frames_dir), str(mode_output_path / "rgb.gif"), pattern="frame_*.png", duration=100)
+        create_video_from_images(str(frames_dir), str(mode_output_path / "rgb_video.mp4"), fps=video_fps, pattern="frame_*.png")
+    
+    # 保存合并的点云
+    print(f"正在生成合并的点云 ({mode_name}模式)...")
+    all_points = []
+    for i, depth_map in enumerate(depth_maps):
+        points_3d = depth_to_pointcloud(depth_map, intrinsics_list[i], extrinsics_list[i])
+        all_points.append(points_3d.reshape(-1, 3))
+    
+    if len(all_points) > 0:
+        all_points = np.concatenate(all_points, axis=0)
+        all_colors = None
+        save_pointcloud_ply(all_points, all_colors, str(mode_output_path / "pointcloud.ply"))
+
+
+def process_single_episode(input_dir, output_dir, model, device, max_frames=None, tracked_pixels=None, video_fps=10.0):
+    """
+    处理单个episode的数据
+    
+    Args:
+        input_dir: 输入目录（包含rgb.mp4和frame_*/目录）
+        output_dir: 输出目录
+        model: DepthAnything3模型
+        device: 设备
+        max_frames: 最大处理帧数
+        tracked_pixels: list of (x, y) tuples，要记录的像素坐标（格式：[(x1, y1), (x2, y2), ...]）
+    """
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # 1. 从视频提取帧
+    video_path = input_path / "rgb.mp4"
+    # if not video_path.exists():
+    #     raise FileNotFoundError(f"找不到视频文件: {video_path}")
+    
+    frames_dir = output_path / "frames"
+    frame_paths = extract_frames_from_video(str(video_path), str(frames_dir), max_frames)
+    
+    # 2. 生成深度图和点云（返回原始和滤波后的深度图）
+    depth_dir = output_path / "depths"
+    depth_maps_raw, depth_maps_filtered, depth_maps_raw_vis, depth_maps_filtered_vis, intrinsics_list, extrinsics_list = generate_depth_and_pointcloud(
+        model, frame_paths, str(depth_dir), device
+    )
+    
+    # 3. 加载标签映射（如果有）
+    labels_path = input_path / "labels.txt"
+    label_map = load_object_labels(str(labels_path))
+    if label_map:
+        print(f"已加载 {len(label_map)} 个物体标签")
+    
+    # 4. 分别处理两种模式
+    # 模式1: 原始深度图
+    print("\n" + "="*60)
+    print("开始处理模式1: 原始深度图")
+    print("="*60)
+    process_with_depth_maps(
+        depth_maps=depth_maps_raw,
+        depth_vis_maps=depth_maps_raw_vis,
+        frame_paths=frame_paths,
+        input_path=input_path,
+        intrinsics_list=intrinsics_list,
+        extrinsics_list=extrinsics_list,
+        output_path=output_path,
+        tracked_pixels=tracked_pixels,
+        label_map=label_map,
+        video_fps=video_fps,
+        mode_name="raw",
+    )
+    
+    # 模式2: 滤波后深度图（自适应滤波，避免残影）
+    print("\n" + "="*60)
+    print("开始处理模式2: 滤波后深度图（自适应滤波，避免移动物体残影）")
+    print("="*60)
+    process_with_depth_maps(
+        depth_maps=depth_maps_filtered,
+        depth_vis_maps=depth_maps_filtered_vis,
+        frame_paths=frame_paths,
+        input_path=input_path,
+        intrinsics_list=intrinsics_list,
+        extrinsics_list=extrinsics_list,
+        output_path=output_path,
+        tracked_pixels=tracked_pixels,
+        label_map=label_map,
+        video_fps=video_fps,
+        mode_name="filtered",
+    )
     
     print(f"\n处理完成！结果保存在: {output_dir}")
+    print(f"  - 原始深度图模式: {output_dir}/raw/")
+    print(f"  - 滤波后深度图模式: {output_dir}/filtered/")
 
 
 def parse_pixel_coords(pixel_str):
