@@ -8,6 +8,8 @@ echo ""
 echo "=== 安装SAM2代码库 ==="
 if [ ! -f "thirdparty/grounded_sam_2/setup.py" ]; then
     echo "SAM2代码库不存在，正在克隆..."
+    # 确保thirdparty目录存在
+    mkdir -p thirdparty
     cd thirdparty
     # 如果目录存在但只有checkpoints，先备份
     if [ -d "grounded_sam_2" ] && [ ! -f "grounded_sam_2/setup.py" ]; then

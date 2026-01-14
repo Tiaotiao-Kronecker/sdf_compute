@@ -29,7 +29,16 @@ pip install -r requirements.txt
 ### 完整安装（包括SAM2等）
 
 ```bash
+# 如果使用git submodule，先初始化submodule
+git submodule update --init --recursive
+
+# 然后运行安装脚本
 ./install_dependencies.sh
+```
+
+**注意**：如果`thirdparty/grounded_sam_2`是git submodule，clone仓库后需要先运行：
+```bash
+git submodule update --init --recursive
 ```
 
 详细安装说明请参考 [INSTALLATION.md](INSTALLATION.md)。

@@ -104,6 +104,9 @@ python -c "from transformers import AutoModel; AutoModel.from_pretrained('senten
 **必须先克隆SAM2代码库**，否则无法导入SAM2模块：
 
 ```bash
+# 确保thirdparty目录存在
+mkdir -p thirdparty
+
 # 如果thirdparty/grounded_sam_2目录已存在但只有checkpoints，需要先备份
 cd thirdparty
 if [ -d "grounded_sam_2" ] && [ ! -f "grounded_sam_2/setup.py" ]; then
