@@ -1,10 +1,34 @@
+# 基础依赖
 torch>=2.0
 torchvision
-numpy
+numpy<2  # 注意：gptqmodel需要numpy==2.2.6，但depth-anything-3需要numpy<2，存在版本冲突
 opencv-python
 Pillow
 tqdm
 scipy
 open3d
 xformers
+
+# brdige_dataset_process_depth.py 需要的依赖
+
+# Qwen-VL-Chat-Int4 模型依赖
+transformers>=4.30.0  # Hugging Face transformers
+accelerate            # 用于device_map和设备管理
+optimum               # 用于GPTQ量化模型加载（Qwen-VL-Chat-Int4需要）
+auto-gptq             # GPTQ量化支持（Qwen-VL-Chat-Int4需要）
+gptqmodel             # optimum 2.1.0需要的GPTQ模型支持（包含FORMAT等）
+sentencepiece         # Qwen-VL需要的tokenizer依赖
+tiktoken              # Qwen-VL需要的tokenizer依赖（用于快速tokenization）
+# transformers_stream_generator  # Qwen-VL的流式生成依赖（可选，如果遇到兼容性问题可以跳过）
+
+# GroundingDINO 模型依赖
+# (使用transformers库，无需额外依赖)
+
+# Sentence Transformers 依赖
+# (使用transformers库，无需额外依赖)
+
+# 其他依赖
+supervision>=0.18.0   # 用于标注和可视化
+decord>=0.6.0         # 视频读取库
+scikit-learn>=1.0.0   # 用于KMeans聚类和PCA降维
 

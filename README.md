@@ -16,37 +16,134 @@
 8. **GIF生成**: 为RGB、标记RGB、深度图、SDF可视化等生成GIF动画
 9. **像素跟踪**（可选）: 记录指定像素的完整SDF计算过程
 10. **RGB标记可视化**（可选）: 在RGB图像上标记追踪像素和最近点像素，生成标记图像和视频
+11. **批处理支持**: 支持批量处理多个episode，包括完整流程批处理和分步批处理
 
 ## 安装
+
+### 基础依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
+### 完整安装（包括SAM2等）
+
+```bash
+./install_dependencies.sh
+```
+
+详细安装说明请参考 [INSTALLATION.md](INSTALLATION.md)。
+
 ## 使用方法
 
-### 基本用法
+### 1. 单个Episode处理
+
+#### 基本用法
 
 ```bash
 python process_sdf.py \
-    --input_dir /home/user/projects/SDF/brige_post_process/test/0 \
+    --input_dir /path/to/input \
     --output_dir output/0 \
-    --model_name depth-anything/DA3-BASE \
     --device cuda \
     --max_frames 10
 ```
 
-### 记录特定像素的详细信息
+#### 带像素跟踪
 
 ```bash
 python process_sdf.py \
-    --input_dir /home/user/projects/SDF/brige_post_process/test/0 \
+    --input_dir /path/to/input \
     --output_dir output/0 \
-    --model_name depth-anything/DA3-BASE \
     --device cuda \
     --max_frames 10 \
-    --track_pixels "100,200;300,400"
+    --track_pixels "320,240;160,120;480,360"
 ```
+
+### 2. 完整流程测试（单个Case）
+
+使用 `test_single_case.py` 测试从bridge数据集到SDF计算的完整流程：
+
+```bash
+python test_single_case.py \
+    --input_dir bridge_depth \
+    --episode_id 00000 \
+    --stream_id 0 \
+    --output_base output/test \
+    --device cuda:0 \
+    --max_frames 10 \
+    --track_pixels "320,240"
+```
+
+**参数说明**：
+- `--input_dir`: bridge数据集输入目录（包含episode目录）
+- `--episode_id`: 要测试的episode ID（例如：00000）
+- `--stream_id`: stream ID（默认0，对应images0）
+- `--output_base`: 输出基础目录（默认：output/test）
+- `--device`: 设备（默认：cuda:0）
+- `--max_frames`: 最大处理帧数（默认10）
+- `--track_pixels`: 像素跟踪坐标（可选）
+- `--skip_dataset_process`: 跳过数据集处理步骤
+- `--skip_sdf`: 跳过SDF计算步骤
+
+### 3. 批处理
+
+#### 完整流程批处理（推荐用于小批量）
+
+一次性完成数据集处理 + SDF计算（每个episode独立处理）：
+
+```bash
+# 1. 编辑配置
+vim batch_process_full.sh
+
+# 2. 修改参数
+INPUT_DIR="bridge_depth"
+EPISODE_IDS=("00000" "00001" "00002")
+TRACK_PIXELS="320,240"
+PARALLEL_JOBS=0  # 0=串行，>0=并行
+
+# 3. 运行
+./batch_process_full.sh
+```
+
+**特点**：
+- 每个episode独立处理（调用 `test_single_case.py`）
+- 支持串行和并行处理
+- 适合小批量（<10个episode）
+
+#### 分步批处理（推荐用于大批量）
+
+步骤1：批量数据集处理（所有episode）
+步骤2：批量SDF计算（所有episode）
+
+```bash
+# 1. 编辑配置
+vim batch_process_stepwise.sh
+
+# 2. 修改参数（同上）
+
+# 3. 运行步骤1（批量数据集处理）
+./batch_process_stepwise.sh
+
+# 4. 如果需要，只运行步骤2（编辑脚本设置 SKIP_STEP1=true）
+vim batch_process_stepwise.sh  # 设置 SKIP_STEP1=true
+./batch_process_stepwise.sh
+```
+
+**特点**：
+- 步骤1一次性处理所有episode（更高效）
+- 步骤2逐个处理episode
+- 可以跳过已完成的步骤
+- 适合大批量（>10个episode）
+
+**批处理配置参数**：
+- `INPUT_DIR`: 输入目录（bridge数据集格式）
+- `OUTPUT_BASE`: 输出基础目录
+- `DEVICE`: 设备（cuda:0/cpu）
+- `MAX_FRAMES`: 最大处理帧数
+- `STREAM_ID`: stream ID（默认0）
+- `TRACK_PIXELS`: 像素跟踪坐标（可选）
+- `EPISODE_IDS`: Episode列表，或自动获取：`EPISODE_IDS=($(ls -d ${INPUT_DIR}/*/ 2>/dev/null | xargs -n1 basename | sort))`
+- `PARALLEL_JOBS`: 并行任务数（0=串行，>0=并行）
 
 ## 输出结果
 
@@ -66,6 +163,7 @@ output/0/
 │   ├── pixel_details/   # 像素详细信息（如果使用--track_pixels）
 │   ├── rgb_marked/      # 标记后的RGB图像（如果使用--track_pixels）
 │   ├── depth.gif        # 原始深度图GIF
+│   ├── depth_video.mp4  # 深度图视频
 │   ├── sdf_vis.gif      # SDF可视化GIF
 │   ├── sdf_exp_vis.gif  # 指数变换SDF可视化GIF
 │   └── pointcloud.ply   # 合并的点云
@@ -79,6 +177,7 @@ output/0/
     ├── pixel_details/   # 像素详细信息（如果使用--track_pixels）
     ├── rgb_marked/      # 标记后的RGB图像（如果使用--track_pixels）
     ├── depth.gif        # 滤波后深度图GIF
+    ├── depth_video.mp4  # 深度图视频
     ├── sdf_vis.gif      # SDF可视化GIF
     ├── sdf_exp_vis.gif  # 指数变换SDF可视化GIF
     └── pointcloud.ply   # 合并的点云
@@ -86,13 +185,24 @@ output/0/
 
 ## 参数说明
 
-- `--input_dir`: 输入目录（包含rgb.mp4和frame_*/目录）
+### process_sdf.py 参数
+
+- `--input_dir`: 输入目录（包含rgb.mp4和frame_*/目录或labels.txt）
 - `--output_dir`: 输出目录
 - `--model_name`: Depth-Anything-3模型名称（默认：depth-anything/DA3-LARGE）
 - `--device`: 设备（cuda/cpu，默认：cuda）
 - `--max_frames`: 最大处理帧数（None表示全部）
 - `--track_pixels`: 要记录的像素坐标，格式：'x1,y1;x2,y2'（可选）
 - `--video_fps`: 生成视频的帧率（默认10.0）
+
+### brdige_dataset_process_depth.py 参数
+
+- `--input_dir`: bridge数据集输入目录（包含episode目录）
+- `--output_dir`: 输出目录
+- `--max_videos`: 最大处理episode数（None表示全部）
+- `--device`: 设备（cuda:0/cpu）
+- `--sam2_checkpoint`: SAM2模型权重路径（可选）
+- `--sam2_model_cfg`: SAM2模型配置文件路径（可选）
 
 ## 双模式处理说明
 
@@ -182,3 +292,54 @@ output/0/
 - 相机坐标系 → 世界坐标系3D点（使用外参）
 - 所有帧的点云合并保存为`pointcloud.ply`文件
 
+## 常见问题
+
+### 1. SAM2导入失败
+
+如果遇到 `ModuleNotFoundError: No module named 'thirdparty.grounded_sam_2.sam2'`，请运行：
+
+```bash
+./install_dependencies.sh
+```
+
+### 2. 模型下载慢
+
+首次运行会自动下载模型，如果下载慢，可以设置Hugging Face镜像：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+### 3. 显存不足
+
+如果显存不足，可以：
+- 减少 `--max_frames` 数量
+- 使用更小的模型（如 `--model_name depth-anything/DA3-BASE`）
+- 使用CPU模式（会很慢）：`--device cpu`
+- 批处理时设置 `PARALLEL_JOBS=0`（串行处理）
+
+### 4. Episode ID格式问题
+
+episode_id 会保留原始格式（如 `00000`），脚本会自动处理格式一致性。如果遇到路径问题，检查实际输出目录。
+
+### 5. 跳过已完成的步骤
+
+如果数据集处理已完成，可以跳过：
+
+```bash
+python test_single_case.py \
+    --input_dir bridge_depth \
+    --episode_id 00000 \
+    --skip_dataset_process \
+    --max_frames 10
+```
+
+## 文档
+
+- [INSTALLATION.md](INSTALLATION.md) - 详细安装指南
+- [TEST_GUIDE.md](TEST_GUIDE.md) - 测试指南
+- [DEPENDENCIES.md](DEPENDENCIES.md) - 依赖说明
+
+## 许可证
+
+本项目基于Depth-Anything-3，请遵循相关许可证要求。

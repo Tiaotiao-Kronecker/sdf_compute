@@ -8,12 +8,71 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# 尝试导入transformers_stream_generator（可选依赖）
+# 如果导入失败，会在模型加载时处理
+try:
+    import transformers_stream_generator
+except ImportError:
+    # 如果transformers_stream_generator不可用，尝试创建一个mock模块
+    # 这可能会在模型加载时导致问题，但我们可以尝试
+    import sys
+    from types import ModuleType
+    mock_module = ModuleType('transformers_stream_generator')
+    sys.modules['transformers_stream_generator'] = mock_module
+    print("[WARN] transformers_stream_generator not found, using mock (may cause issues)")
+
+# 修复optimum和auto-gptq的兼容性问题
+# optimum 2.1.0期望QuantizeConfig，但auto-gptq 0.7.1只有BaseQuantizeConfig
+try:
+    import auto_gptq
+    if not hasattr(auto_gptq, 'QuantizeConfig') and hasattr(auto_gptq, 'BaseQuantizeConfig'):
+        auto_gptq.QuantizeConfig = auto_gptq.BaseQuantizeConfig
+        # 同时修复optimum.gptq中的引用
+        import optimum.gptq.quantizer as gptq_quantizer
+        if not hasattr(gptq_quantizer, 'QuantizeConfig'):
+            gptq_quantizer.QuantizeConfig = auto_gptq.BaseQuantizeConfig
+except (ImportError, AttributeError) as e:
+    print(f"[WARN] 无法修复QuantizeConfig兼容性: {e}")
+
+# 修复optimum 2.1.0的FORMAT导入问题
+# optimum 2.1.0期望从gptqmodel.quantization导入FORMAT
+try:
+    from gptqmodel.quantization import FORMAT
+    # 确保optimum.gptq.quantizer可以访问FORMAT
+    import optimum.gptq.quantizer as gptq_quantizer
+    if not hasattr(gptq_quantizer, 'FORMAT'):
+        gptq_quantizer.FORMAT = FORMAT
+except ImportError:
+    # 如果gptqmodel未安装，尝试从auto_gptq创建兼容的FORMAT
+    try:
+        from enum import Enum
+        class FORMAT(Enum):
+            GPTQ = 'gptq'
+            MARLIN = 'marlin'
+        # 注入到optimum.gptq.quantizer
+        import optimum.gptq.quantizer as gptq_quantizer
+        # 尝试修复导入
+        import sys
+        if 'gptqmodel' not in sys.modules:
+            from types import ModuleType
+            gptqmodel_mock = ModuleType('gptqmodel')
+            gptqmodel_quantization = ModuleType('gptqmodel.quantization')
+            gptqmodel_quantization.FORMAT = FORMAT
+            gptqmodel_mock.quantization = gptqmodel_quantization
+            sys.modules['gptqmodel'] = gptqmodel_mock
+            sys.modules['gptqmodel.quantization'] = gptqmodel_quantization
+        print("[WARN] gptqmodel未安装，使用兼容性补丁（可能不稳定）")
+        print("      建议运行: pip install gptqmodel -i https://pypi.org/simple")
+    except Exception as e:
+        print(f"[WARN] 无法创建FORMAT兼容性补丁: {e}")
+
 import json
 import re
 import random
 import fnmatch
 import shutil
 import inspect
+from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from collections import Counter, defaultdict
 from itertools import chain
@@ -161,17 +220,27 @@ def copy_non_image_folders(src_dir: str, dst_dir: str) -> None:
 _EP_RE = re.compile(r"^\d+$")
 _IMG_DIR_RE = re.compile(r"^(images|image)(\d+)$")  # images0/images1... or image0/image1...
 
-def list_episodes(input_dir: str, max_videos: Optional[int] = None) -> List[Tuple[int, str]]:
+def list_episodes(input_dir: str, max_videos: Optional[int] = None) -> List[Tuple[str, str]]:
+    """
+    列出所有episode目录
+    
+    Returns:
+        List[Tuple[str, str]]: [(episode_id_str, episode_path), ...]
+        保留原始的episode_id字符串格式（如"00000"），而不是转换为整数
+    """
     eps = []
     for name in os.listdir(input_dir):
         if _EP_RE.match(name):
             p = os.path.join(input_dir, name)
             if os.path.isdir(p):
-                eps.append((int(name), p))
-    eps.sort(key=lambda x: x[0])
+                # 保留原始字符串格式，但同时也保存整数用于排序
+                ep_int = int(name)
+                eps.append((name, p, ep_int))  # (原始字符串, 路径, 整数用于排序)
+    # 按整数排序，但返回时使用原始字符串
+    eps.sort(key=lambda x: x[2])
     if max_videos is not None:
         eps = eps[:max_videos]
-    return eps
+    return [(ep_id_str, ep_path) for ep_id_str, ep_path, _ in eps]
 
 
 def find_all_image_stream_dirs(ep_dir: str) -> Dict[int, str]:
@@ -230,11 +299,10 @@ def build_rgb_videos_all_streams(
     print("[Step A] Building rgb.mp4 under output/{episode}/images{sid}/ ...")
     print("=" * 50)
 
-    for ep_int, ep_dir in tqdm(episodes, desc="Build rgb videos"):
-        episode_id = str(ep_int)
+    for episode_id, ep_dir in tqdm(episodes, desc="Build rgb videos"):
         streams = find_all_image_stream_dirs(ep_dir)
         if not streams:
-            print(f"[WARN] episode {ep_int:05d} has no imagesK/imageK: {ep_dir}")
+            print(f"[WARN] episode {episode_id} has no imagesK/imageK: {ep_dir}")
             continue
 
         for sid, img_dir in streams.items():
@@ -514,8 +582,11 @@ def get_labels_from_stream_videos(
     all_labels_file_path: str,
     box_th: float = 0.25,
     text_th: float = 0.3,
+    sam2_checkpoint: Optional[str] = None,
+    sam2_model_cfg: Optional[str] = None,
+    device: str = "cuda:0",
 ):
-    device = torch.device("cuda:0")
+    device_obj = torch.device(device)
 
     with open(all_captions_file_path, "r", encoding="utf-8") as f:
         all_captions_list = [json.loads(line.strip()) for line in f if line.strip()]
@@ -531,17 +602,29 @@ def get_labels_from_stream_videos(
     # optional extra label
     all_labels.append("black robot gripper")
 
-    # SAM2
-    sam2_checkpoint = "thirdparty/grounded_sam_2/checkpoints/sam2.1_hiera_large.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_l"
-    video_predictor: SAM2VideoPredictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
-    sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
+    # SAM2 - 使用可配置路径
+    if sam2_checkpoint is None:
+        # 默认路径：相对于脚本目录
+        script_dir = Path(__file__).parent
+        sam2_checkpoint = str(script_dir / "thirdparty" / "grounded_sam_2" / "checkpoints" / "sam2.1_hiera_large.pt")
+    if sam2_model_cfg is None:
+        # 默认配置：相对于SAM2代码库
+        sam2_model_cfg = "configs/sam2.1/sam2.1_hiera_l"
+    
+    # 检查checkpoint是否存在
+    if not os.path.exists(sam2_checkpoint):
+        raise FileNotFoundError(f"SAM2 checkpoint not found: {sam2_checkpoint}")
+    
+    print(f"Loading SAM2 from checkpoint: {sam2_checkpoint}")
+    print(f"Using SAM2 config: {sam2_model_cfg}")
+    video_predictor: SAM2VideoPredictor = build_sam2_video_predictor(sam2_model_cfg, sam2_checkpoint)
+    sam2_image_model = build_sam2(sam2_model_cfg, sam2_checkpoint)
     image_predictor = SAM2ImagePredictor(sam2_image_model)  # not strictly required, but keep for consistency
 
     # GroundingDINO
     model_id = "IDEA-Research/grounding-dino-base"
     processor = AutoProcessor.from_pretrained(model_id)
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device).eval()
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device_obj).eval()
 
     def postprocess_grounding(outputs, input_ids, target_sizes):
         fn = processor.post_process_grounded_object_detection
@@ -790,6 +873,8 @@ def main(
     max_videos: Optional[int] = None,
     extract_frame_idx: int = 0,
     device: str = "cuda:0",
+    sam2_checkpoint: Optional[str] = None,
+    sam2_model_cfg: Optional[str] = None,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -799,8 +884,7 @@ def main(
     print("=" * 50)
 
     episodes = list_episodes(input_dir, max_videos=max_videos)
-    for ep_int, ep_path in episodes:
-        episode_id = str(ep_int)
+    for episode_id, ep_path in episodes:
         dst_dir = os.path.join(output_dir, episode_id)
         try:
             copy_non_image_folders(ep_path, dst_dir)
@@ -843,6 +927,9 @@ def main(
         samples=samples,
         all_captions_file_path=all_captions_file_path,
         all_labels_file_path=all_labels_file_path,
+        sam2_checkpoint=sam2_checkpoint,
+        sam2_model_cfg=sam2_model_cfg,
+        device=device,
     )
 
     # Step 4: postprocess labels (write annotated_frame_color/index and optional gif)
@@ -857,16 +944,32 @@ def main(
 
 
 if __name__ == "__main__":
-    input_dir = "/media/xuran-yao/WM/bridge_dataset/bridge_depth"
-    output_dir = "/media/xuran-yao/WM/bridge_dataset/bridge_wc"
-    max_videos = 10
-    extract_frame_idx = 0
-    device = "cuda:0"
-
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Bridge数据集处理：生成RGB视频、描述和分割掩码")
+    parser.add_argument("--input_dir", type=str, required=True,
+                       help="输入目录（包含episode目录，每个episode下有images0/images1/等）")
+    parser.add_argument("--output_dir", type=str, required=True,
+                       help="输出目录")
+    parser.add_argument("--max_videos", type=int, default=None,
+                       help="最大处理视频数（None表示全部）")
+    parser.add_argument("--extract_frame_idx", type=int, default=0,
+                       help="用于生成描述的帧索引（默认0）")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                       help="设备 (cuda:0/cpu)")
+    parser.add_argument("--sam2_checkpoint", type=str, default=None,
+                       help="SAM2模型权重路径（默认：thirdparty/grounded_sam_2/checkpoints/sam2.1_hiera_large.pt）")
+    parser.add_argument("--sam2_model_cfg", type=str, default=None,
+                       help="SAM2模型配置（默认：configs/sam2.1/sam2.1_hiera_l）")
+    
+    args = parser.parse_args()
+    
     main(
-        input_dir=input_dir,
-        output_dir=output_dir,
-        max_videos=max_videos,
-        extract_frame_idx=extract_frame_idx,
-        device=device,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        max_videos=args.max_videos,
+        extract_frame_idx=args.extract_frame_idx,
+        device=args.device,
+        sam2_checkpoint=args.sam2_checkpoint,
+        sam2_model_cfg=args.sam2_model_cfg,
     )

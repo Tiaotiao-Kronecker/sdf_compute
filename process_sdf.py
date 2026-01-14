@@ -123,7 +123,7 @@ def generate_depth_and_pointcloud(model, frame_paths, output_dir, device):
     Args:
         model: DepthAnything3模型
         frame_paths: 帧文件路径列表
-        output_dir: 输出目录
+        output_dir: 输出目录（仅用于临时存储，实际深度图保存在process_with_depth_maps中）
         device: 设备
     
     Returns:
@@ -134,7 +134,9 @@ def generate_depth_and_pointcloud(model, frame_paths, output_dir, device):
         intrinsics_list: 内参列表
         extrinsics_list: 外参列表
     """
-    os.makedirs(output_dir, exist_ok=True)
+    # 注意：这个函数不再需要创建输出目录，因为它不保存文件
+    # 所有文件都在 process_with_depth_maps 中保存
+    # os.makedirs(output_dir, exist_ok=True)  # 已移除，避免创建空目录
     
     # 将模型移到设备
     model = model.to(device)
@@ -1230,9 +1232,10 @@ def process_single_episode(input_dir, output_dir, model, device, max_frames=None
     frame_paths = extract_frames_from_video(str(video_path), str(frames_dir), max_frames)
     
     # 2. 生成深度图和点云（返回原始和滤波后的深度图）
-    depth_dir = output_path / "depths"
+    # 注意：generate_depth_and_pointcloud 的 output_dir 参数仅用于创建目录，实际深度图保存在 process_with_depth_maps 中
+    temp_depth_dir = output_path / "temp_depths"
     depth_maps_raw, depth_maps_filtered, depth_maps_raw_vis, depth_maps_filtered_vis, intrinsics_list, extrinsics_list = generate_depth_and_pointcloud(
-        model, frame_paths, str(depth_dir), device
+        model, frame_paths, str(temp_depth_dir), device
     )
     
     # 3. 加载标签映射（如果有）
@@ -1277,6 +1280,28 @@ def process_single_episode(input_dir, output_dir, model, device, max_frames=None
         video_fps=video_fps,
         mode_name="filtered",
     )
+    
+    # 清理临时目录（如果存在且为空）
+    import shutil
+    if temp_depth_dir.exists():
+        try:
+            # 检查目录是否为空
+            if not any(temp_depth_dir.iterdir()):
+                shutil.rmtree(temp_depth_dir, ignore_errors=True)
+                print(f"已清理临时目录: {temp_depth_dir}")
+        except Exception:
+            pass
+    
+    # 清理可能遗留的空depths目录（旧版本代码可能创建的顶层depths目录）
+    legacy_depths_dir = output_path / "depths"
+    if legacy_depths_dir.exists():
+        try:
+            # 检查目录是否为空
+            if not any(legacy_depths_dir.iterdir()):
+                shutil.rmtree(legacy_depths_dir, ignore_errors=True)
+                print(f"已清理遗留的空depths目录: {legacy_depths_dir}")
+        except Exception:
+            pass
     
     print(f"\n处理完成！结果保存在: {output_dir}")
     print(f"  - 原始深度图模式: {output_dir}/raw/")
